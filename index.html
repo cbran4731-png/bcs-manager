@@ -509,7 +509,6 @@ textarea.form-textarea{resize:vertical;min-height:80px}
           <select class="form-select" id="projects-team-filter" onchange="onProjectsTeamFilterChange()" style="font-size:12px;padding:6px 10px;width:200px">
             <option value="">All team members</option>
           </select>
-          <button class="btn" onclick="openModal('manage-team-filter-modal');renderManageTeamFilterModal()" title="Hide company names or other non-people from this list" style="padding:6px 8px"><i class="ti ti-settings"></i></button>
           <button class="btn btn-primary" onclick="openModal('new-item-modal')"><i class="ti ti-plus"></i> New Project</button>
         </div>
       </div>
@@ -2264,15 +2263,13 @@ function getActivePhasesFor(project){
   return {phases,colors};
 }
 
-// Returns every person associated with a project — both the named role fields
-// (PM, Fabricator, Installer, Material, Supplier) and anyone in the project's
-// Team list — as a deduplicated array of names. Used for the team filter on
-// the Projects page and anywhere else "who's on this job" matters.
 // Returns every PERSON associated with a project — Project Manager, Fabricator,
-// Installer, and anyone in the project's Team list. Deliberately excludes Material
-// and Supplier, since those fields hold product/company names (e.g. "Black Shaker
-// Cabs", "KNB Cabinets"), not people, even though they're stored alongside the
-// people-related fields on the project.
+// Installer, and anyone in the project's Team list — based on whatever text was
+// typed into those fields. Used to check whether a given person (selected in the
+// Projects page team filter) is associated with this project, and to show a
+// quick "who's on this job" line on each project card. Deliberately excludes
+// Material and Supplier, since those fields hold product/company names (e.g.
+// "Black Shaker Cabs", "KNB Cabinets"), not people.
 function getAllPeopleOnProject(p){
   const names=new Set();
   [p.pm,p.fabricator,p.installer].forEach(n=>{
@@ -2294,78 +2291,36 @@ function normalizePersonName(name){
   return name.trim().replace(/\.$/,'').trim();
 }
 
-// Returns a sorted, deduplicated list of every person across all projects —
-// used to populate the team filter dropdown on the Projects page. Excludes
-// anything the user has explicitly marked as "not a person" via
-// excludeFromTeamFilter() — needed because fields like Fabricator/Installer
-// sometimes legitimately hold a company name instead of a person's name
-// (e.g. a cabinet job's "Fabricator" is the cabinet shop itself), and there's
-// no reliable way to tell company names apart from person names automatically.
+// Returns the list of names to show in the Projects page team filter — pulled
+// directly from the Directory page, since that's the one place names are
+// deliberately curated by the user (as opposed to Fabricator/Installer fields
+// on a project, which sometimes legitimately hold a company name instead of a
+// person, e.g. a cabinet job's "Fabricator" being the cabinet shop itself).
+// Adding someone to the Directory automatically makes them a filter option;
+// nothing else needs to be kept in sync.
+// Returns the list of names to show in the Projects page team filter — pulled
+// directly from the Directory page, since that's the one place names are
+// deliberately curated by the user (as opposed to Fabricator/Installer fields
+// on a project, which sometimes legitimately hold a company name instead of a
+// person, e.g. a cabinet job's "Fabricator" being the cabinet shop itself).
+// Adding someone to the Directory automatically makes them a filter option;
+// nothing else needs to be kept in sync.
+// Note: deliberately checks real Directory rows directly rather than going
+// through getDirectoryMembers(), since that function injects a placeholder
+// "Brian Kline" row when the Directory is empty (useful for other features
+// that want a sensible default), which would otherwise show up as a fake,
+// unremovable entry in this filter.
 function getAllKnownTeamMembers(){
-  if(!appState.teamFilterExclusions)appState.teamFilterExclusions=[];
-  const excluded=new Set(appState.teamFilterExclusions);
+  const rows=document.querySelectorAll('#page-directory .data-table tbody tr');
   const names=new Set();
-  projectData.forEach(p=>getAllPeopleOnProject(p).forEach(n=>names.add(n)));
-  return [...names].filter(n=>!excluded.has(n)).sort((a,b)=>a.localeCompare(b));
-}
-
-// Permanently hides a name from the team filter dropdown going forward (e.g. for
-// company names that ended up in a person field like Fabricator or Installer).
-// Persisted in appState so it syncs with the rest of the data and survives reload.
-function excludeFromTeamFilter(name){
-  if(!appState.teamFilterExclusions)appState.teamFilterExclusions=[];
-  if(!appState.teamFilterExclusions.includes(name)){
-    appState.teamFilterExclusions.push(name);
-    scheduleSave();
-  }
-  refreshProjectsTeamFilter();
-  renderProjectCards();
-  toast(`"${name}" hidden from the team filter. You can restore it from the dropdown's manage option.`);
-}
-
-// Restores a previously-excluded name back into the team filter dropdown
-function restoreToTeamFilter(name){
-  if(!appState.teamFilterExclusions)return;
-  appState.teamFilterExclusions=appState.teamFilterExclusions.filter(n=>n!==name);
-  scheduleSave();
-  refreshProjectsTeamFilter();
-  toast(`"${name}" restored to the team filter.`);
-}
-
-// Populates the "Manage Team Filter List" modal — shows every name currently
-// visible in the filter (each with a "Hide" button) and, below that, anything
-// already hidden (each with a "Restore" button).
-function renderManageTeamFilterModal(){
-  if(!appState.teamFilterExclusions)appState.teamFilterExclusions=[];
-  const allNames=new Set();
-  projectData.forEach(p=>getAllPeopleOnProject(p).forEach(n=>allNames.add(n)));
-  const excluded=appState.teamFilterExclusions;
-  const visible=[...allNames].filter(n=>!excluded.includes(n)).sort((a,b)=>a.localeCompare(b));
-  const hidden=excluded.filter(n=>allNames.has(n)).sort((a,b)=>a.localeCompare(b));
-
-  const activeList=document.getElementById('manage-team-filter-active-list');
-  if(activeList){
-    activeList.innerHTML=visible.length?visible.map(n=>`
-      <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--gray-100)">
-        <span style="font-size:13px">${n}</span>
-        <button class="btn" style="padding:3px 10px;font-size:11px" onclick="excludeFromTeamFilter('${n.replace(/'/g,"\\'")}');renderManageTeamFilterModal()">Hide</button>
-      </div>`).join(''):'<div style="font-size:12px;color:var(--gray-500);padding:8px 0">No names found yet.</div>';
-  }
-
-  const hiddenSection=document.getElementById('manage-team-filter-hidden-section');
-  const hiddenList=document.getElementById('manage-team-filter-hidden-list');
-  if(hiddenSection&&hiddenList){
-    if(hidden.length){
-      hiddenSection.style.display='';
-      hiddenList.innerHTML=hidden.map(n=>`
-        <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--gray-100)">
-          <span style="font-size:13px;color:var(--gray-500)">${n}</span>
-          <button class="btn" style="padding:3px 10px;font-size:11px" onclick="restoreToTeamFilter('${n.replace(/'/g,"\\'")}');renderManageTeamFilterModal()">Restore</button>
-        </div>`).join('');
-    } else {
-      hiddenSection.style.display='none';
+  rows.forEach(row=>{
+    const nameEl=row.querySelector('td strong');
+    if(nameEl){
+      const name=nameEl.textContent.trim();
+      if(name)names.add(name);
     }
-  }
+  });
+  return [...names].sort((a,b)=>a.localeCompare(b));
 }
 
 const projectData=[];
@@ -2682,6 +2637,7 @@ function nav(id,el){
   document.getElementById('page-title').textContent=pages[id]||id;
   appState.activePage=id;
   if(id==='dashboard')setTimeout(renderDashboard,0);
+  if(id==='projects')setTimeout(refreshProjectsTeamFilter,0);
   if(id==='timeline')setTimeout(()=>{renderMasterTimeline();refreshPlanSelector();},0);
   if(id==='schedule'){setTimeout(()=>{renderScheduleProjectPicker();renderGantt();},0);}
   if(id==='budget')setTimeout(renderBudgetPage,0);
@@ -3162,7 +3118,6 @@ function applyState(){
   if(!appState.drawingItems)appState.drawingItems=[];
   if(!appState.documentItems)appState.documentItems=[];
   if(!appState.budgetCostLines)appState.budgetCostLines={};
-  if(!appState.teamFilterExclusions)appState.teamFilterExclusions=[];
 
   // Compute days since last incident dynamically so it stays current day-to-day
   if(appState.lastIncidentDate){
@@ -5551,29 +5506,7 @@ setTimeout(()=>{
 </div>
 
 
-<!-- MANAGE TEAM FILTER MODAL -->
-<div class="modal-overlay" id="manage-team-filter-modal">
-  <div class="modal" style="width:460px">
-    <div class="modal-header">
-      <div class="modal-title"><i class="ti ti-settings" style="margin-right:6px"></i>Manage Team Filter List</div>
-      <button class="modal-close" onclick="closeModal('manage-team-filter-modal')"><i class="ti ti-x"></i></button>
-    </div>
-    <div class="modal-body" style="padding:20px">
-      <div style="font-size:12px;color:var(--gray-500);margin-bottom:14px;padding:10px 12px;background:var(--gray-50);border-radius:var(--radius);line-height:1.5">
-        If a company name or product (like a fabricator's business name) shows up in the team filter instead of a person, hide it here. You can always bring it back later.
-      </div>
-      <div style="font-size:11px;font-weight:700;color:var(--gray-500);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Currently in the filter</div>
-      <div id="manage-team-filter-active-list" style="margin-bottom:16px;max-height:220px;overflow-y:auto"></div>
-      <div id="manage-team-filter-hidden-section" style="display:none">
-        <div style="font-size:11px;font-weight:700;color:var(--gray-500);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;border-top:1px solid var(--gray-200);padding-top:14px">Hidden</div>
-        <div id="manage-team-filter-hidden-list" style="max-height:160px;overflow-y:auto"></div>
-      </div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn" onclick="closeModal('manage-team-filter-modal')">Done</button>
-    </div>
-  </div>
-</div>
+
 
 <div class="modal-overlay" id="share-team-modal">
   <div class="modal" style="width:520px">
