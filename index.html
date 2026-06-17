@@ -2590,8 +2590,28 @@ function renderProjectCards(){
       });
       const groupNames=Object.keys(groups).sort();
 
+      // Within each type column: active projects first (soonest due date at the
+      // top), with completed/done projects pushed to the bottom of the column.
+      // Projects with an unparseable or missing due date (e.g. "TBD") sort after
+      // dated active projects but still ahead of anything marked done.
+      const sortProjectsForDisplay=(list)=>{
+        const parseDue=p=>{
+          const d=new Date(p.due);
+          return isNaN(d.getTime())?null:d;
+        };
+        return [...list].sort((a,b)=>{
+          const aDone=!isProjectActive(a), bDone=!isProjectActive(b);
+          if(aDone!==bDone)return aDone?1:-1; // done projects always sink to the bottom
+          const aDate=parseDue(a), bDate=parseDue(b);
+          if(aDate&&bDate)return aDate-bDate; // soonest due date first
+          if(aDate&&!bDate)return -1; // dated projects rank above undated ones
+          if(!aDate&&bDate)return 1;
+          return a.name.localeCompare(b.name); // fallback: alphabetical for ties
+        });
+      };
+
       const columns=groupNames.map(typeName=>{
-        const cards=groups[typeName].map(p=>{
+        const cards=sortProjectsForDisplay(groups[typeName]).map(p=>{
           const {phases,colors}=getActivePhasesFor(p);
           const phase=p.phase||phases[0];
           const phaseColor=colors[phase]||'#868E96';
