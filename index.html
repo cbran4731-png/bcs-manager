@@ -343,7 +343,7 @@ textarea.form-textarea{resize:vertical;min-height:80px}
 }
 </style>
 <!-- Microsoft Authentication Library -->
-<script src="https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js"></script>
+<!-- JSONBin sync replaces Microsoft OneDrive auth -->
 <!-- SheetJS for Excel import/export -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <!-- jsPDF + html2canvas for client-side PDF report generation -->
@@ -432,20 +432,14 @@ textarea.form-textarea{resize:vertical;min-height:80px}
         </div>
         <div id="global-search-results" style="display:none;position:absolute;top:calc(100% + 6px);left:0;width:340px;max-height:420px;overflow-y:auto;background:#fff;border:1px solid var(--gray-200);border-radius:var(--radius);box-shadow:0 8px 24px rgba(0,0,0,.15);z-index:500"></div>
       </div>
-      <!-- OneDrive sync status -->
-      <div class="sync-badge signed-out" id="sync-badge"><i class="ti ti-brand-onedrive"></i> <span id="sync-label">Not signed in</span></div>
+      <!-- Sync status -->
+      <div class="sync-badge signed-out" id="sync-badge"><i class="ti ti-cloud"></i> <span id="sync-label">Connecting…</span></div>
       <button class="btn" onclick="manualSync()" title="Sync now" id="manual-sync-btn"><i class="ti ti-refresh"></i></button>
-      <button class="btn" onclick="openModal('share-team-modal')" title="Give teammates access to this same data" id="share-team-btn" style="display:none"><i class="ti ti-users"></i> <span class="btn-label">Share with team</span></button>
-      <button class="btn" id="ms-signin-btn" onclick="msSignIn()" style="display:flex;align-items:center;gap:6px">
-        <img src="https://learn.microsoft.com/en-us/azure/active-directory/develop/media/howto-add-branding-in-apps/ms-symbollockup_signin_light.png" style="height:18px" onerror="this.style.display='none'">
-        <span id="ms-btn-label">Sign in with Microsoft</span>
-      </button>
       <button class="btn" onclick="exportData()" title="Download a local backup"><i class="ti ti-download"></i> <span class="btn-label">Backup</span></button>
       <label class="btn" style="cursor:pointer" title="Restore from backup"><i class="ti ti-upload"></i> <span class="btn-label">Restore</span><input type="file" accept=".bcs,.json" id="import-fallback" style="display:none" onchange="importData(event)"></label>
-      <button class="btn" onclick="forceResync()" title="Clear cached file reference and reload fresh from OneDrive" id="force-resync-btn" style="display:none"><i class="ti ti-refresh"></i> <span class="btn-label">Re-sync</span></button>
       <button class="btn btn-primary" onclick="openModal('new-item-modal')"><i class="ti ti-plus"></i> <span class="btn-label">New Item</span></button>
       <button class="btn" style="position:relative"><i class="ti ti-bell"></i><span style="position:absolute;top:6px;right:6px;width:7px;height:7px;border-radius:50%;background:var(--orange);display:block"></span></button>
-      <div class="avatar" id="user-avatar" title="Sign in with Microsoft">KL</div>
+      <div class="avatar" id="user-avatar" title="BCS Manager">BC</div>
     </div>
   </div>
 
@@ -1796,483 +1790,177 @@ function restoreDOM(){
 }
 
 // ── Microsoft Graph / OneDrive Integration ────────────────────
-const MS_CLIENT_ID='eefac8a7-50f1-47a3-ae61-ed4e767b3000';
-const MS_TENANT_ID='2eb5d7c6-735e-4794-8b0e-7998f13f5730';
-const ONEDRIVE_FILE='BCSManagerData.bcs';
-const GRAPH_SCOPES=['Files.ReadWrite','User.Read'];
-// Cached location of the shared data file once resolved, so we don't have to
-// re-search "shared with me" on every load/save. {driveId, itemId} or null.
-let _sharedFileRef=JSON.parse(localStorage.getItem('bcs-shared-file-ref')||'null');
+// ── JSONBin sync — no login required ─────────────────────────
+// All data is stored in a JSONBin.io bin. Anyone with the app URL
+// can read and write — no Microsoft account, no login of any kind.
+const JSONBIN_BIN_ID='6a46973ff5f4af5e295527cc';
+const JSONBIN_KEY='$2a$10$CUHL5p6f03IB8/S2IBxGYer/Q8h7OfGY.xteZ2I7fqJnxoIM20Kzy';
+const JSONBIN_URL=`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`;
 
-let msalInstance=null;
-let msAccount=null;
-let _graphToken=null;
-let _syncTimer=null;
+let _bgSyncInterval=null;
+let _lastKnownSaveTimestamp=null;
+let _isSaving=false; // prevent overlapping saves
 
-function initMSAL(){
+async function loadFromJSONBin(){
   try{
-    msalInstance=new msal.PublicClientApplication({
-      auth:{
-        clientId:MS_CLIENT_ID,
-        authority:`https://login.microsoftonline.com/common`,
-        redirectUri:'https://cbran4731-png.github.io/bcs-manager/'
-      },
-      cache:{
-        // Safari ITP blocks third-party cookies and can block localStorage too.
-        // sessionStorage is more reliably accessible in Safari, and the cookie
-        // flag ensures the auth state survives ITP's iframe restrictions.
-        cacheLocation:_isSafari?'sessionStorage':'localStorage',
-        storeAuthStateInCookie:true
-      },
-      system:{loggerOptions:{logLevel:msal.LogLevel.Warning}}
+    setSyncBadge('syncing','Loading…');
+    const res=await fetch(JSONBIN_URL+'/latest',{
+      headers:{'X-Master-Key':JSONBIN_KEY,'X-Bin-Meta':'false'}
     });
-    // Handle redirect result first (handles return from Microsoft login page)
-    msalInstance.handleRedirectPromise().then(result=>{
-      if(result&&result.account){
-        msAccount=result.account;
-        onSignedIn(msAccount);
-      } else {
-        // Check if already signed in from a previous session
-        const accounts=msalInstance.getAllAccounts();
-        if(accounts.length>0){
-          msAccount=accounts[0];
-          onSignedIn(msAccount);
-        }
-      }
-    }).catch(e=>console.warn('MSAL redirect handler:',e));
-  }catch(e){console.warn('MSAL init error:',e);}
-}
-
-async function msSignIn(){
-  if(msAccount){msSignOut();return;}
-  if(!msalInstance){alert('Authentication not initialized. Please refresh the page.');return;}
-  setSyncBadge('signing-in','Redirecting to Microsoft…');
-  try{
-    // Always use redirect — avoids popup blocking issues
-    await msalInstance.loginRedirect({
-      scopes:GRAPH_SCOPES,
-      prompt:'select_account'
-    });
-  }catch(e){
-    if(!e.message?.includes('cancelled')){
-      setSyncBadge('error','Sign-in failed');
-      console.warn('Sign-in error:',e);
-    } else {
-      setSyncBadge('signed-out','Not signed in');
-    }
-  }
-}
-
-function msSignOut(){
-  if(!msAccount)return;
-  msalInstance.logoutPopup({account:msAccount});
-  msAccount=null;
-  _graphToken=null;
-  stopBackgroundSync();
-  setSyncBadge('signed-out','Not signed in');
-  document.getElementById('ms-btn-label').textContent='Sign in with Microsoft';
-  document.getElementById('user-avatar').textContent='KL';
-  document.getElementById('user-avatar').title='Sign in with Microsoft';
-  const shareBtn=document.getElementById('share-team-btn');
-  if(shareBtn)shareBtn.style.display='none';
-}
-
-async function onSignedIn(account){
-  const name=account.name||account.username;
-  const initials=name.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2)||'MS';
-  document.getElementById('user-avatar').textContent=initials;
-  document.getElementById('user-avatar').title=`${name} · Click to sign out`;
-  document.getElementById('user-avatar').onclick=msSignOut;
-  document.getElementById('ms-btn-label').textContent=name.split(' ')[0];
-  const shareBtn=document.getElementById('share-team-btn');
-  if(shareBtn)shareBtn.style.display='';
-  const resyncBtn=document.getElementById('force-resync-btn');
-  if(resyncBtn)resyncBtn.style.display='';
-  // On Safari, show a prominent reload prompt since the initial data load
-  // may have failed due to ITP blocking the silent token acquisition.
-  if(_isSafari){
-    toast('Safari detected — tap Re-sync if your data does not appear.');
-  }
-  setSyncBadge('syncing','Loading from OneDrive…');
-  // Load data from OneDrive
-  await loadFromOneDrive();
-  // Refresh the OneDrive browser tab if it's currently open
-  if(document.getElementById('page-onedrive')?.classList.contains('active'))odInit();
-  // Start polling for other users' changes every 2 minutes
-  startBackgroundSync();
-}
-
-// Detect Safari — it blocks silent iframe-based token refresh (ITP), so we
-// need to handle token acquisition differently on Safari vs other browsers.
-const _isSafari=/^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-
-async function getGraphToken(){
-  if(!msAccount||!msalInstance)return null;
-
-  // On Safari, acquireTokenSilent uses a hidden iframe which ITP blocks.
-  // Use the cached token directly if we have one that's likely still valid
-  // (MSAL access tokens last 1 hour), and only re-acquire via popup when needed.
-  if(_isSafari&&_graphToken){
-    return _graphToken;
-  }
-
-  try{
-    const result=await msalInstance.acquireTokenSilent({scopes:GRAPH_SCOPES,account:msAccount});
-    _graphToken=result.accessToken;
-    return _graphToken;
-  }catch(e){
-    // Silent failed (expected on Safari due to ITP) — try popup as fallback.
-    // On Safari this only works if triggered by a user gesture, so we also
-    // cache the token aggressively to minimise how often we need to re-acquire.
-    try{
-      const result=await msalInstance.acquireTokenPopup({scopes:GRAPH_SCOPES,account:msAccount});
-      _graphToken=result.accessToken;
-      return _graphToken;
-    }catch(e2){
-      console.warn('Token error:',e2);
-      // If popup was blocked (Safari without user gesture), return cached token
-      // as a last resort — it may still be valid from the initial sign-in.
-      if(_graphToken){
-        console.warn('Returning cached token as last resort');
-        return _graphToken;
-      }
-      return null;
-    }
-  }
-}
-
-// Resolves where the team's shared data file actually lives, so everyone — owner
-// and teammates the file was shared with — reads/writes the SAME file regardless
-// of whose OneDrive it physically sits in.
-//
-// Resolution order:
-//  1. Use a cached {driveId,itemId} from a previous resolution (fast path)
-//  2. Check the signed-in user's OWN OneDrive root for the file (covers the owner)
-//  3. Search "Shared with me" for a file with the same name (covers teammates)
-//  4. If nothing found anywhere, fall back to creating it in the user's own root
-//     (covers a first-ever run before any sharing has happened)
-async function resolveSharedDataFile(token){
-  if(_sharedFileRef&&_sharedFileRef.driveId&&_sharedFileRef.itemId)return _sharedFileRef;
-
-  // Step 2: check own root
-  try{
-    const ownRes=await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${ONEDRIVE_FILE}`,{
-      headers:{Authorization:`Bearer ${token}`}
-    });
-    if(ownRes.ok){
-      const meta=await ownRes.json();
-      _sharedFileRef={driveId:meta.parentReference.driveId,itemId:meta.id,isOwner:true};
-      localStorage.setItem('bcs-shared-file-ref',JSON.stringify(_sharedFileRef));
-      return _sharedFileRef;
-    }
-  }catch(e){console.warn('Own-drive check failed:',e);}
-
-  // Step 3: check shared-with-me
-  try{
-    const sharedRes=await fetch(`https://graph.microsoft.com/v1.0/me/drive/sharedWithMe`,{
-      headers:{Authorization:`Bearer ${token}`}
-    });
-    if(sharedRes.ok){
-      const data=await sharedRes.json();
-      const match=(data.value||[]).find(item=>item.name===ONEDRIVE_FILE);
-      if(match&&match.remoteItem){
-        _sharedFileRef={driveId:match.remoteItem.parentReference.driveId,itemId:match.remoteItem.id,isOwner:false};
-        localStorage.setItem('bcs-shared-file-ref',JSON.stringify(_sharedFileRef));
-        return _sharedFileRef;
-      }
-    }
-  }catch(e){console.warn('Shared-with-me check failed:',e);}
-
-  // Step 4: not found anywhere — will be created fresh in the user's own root on first save
-  return null;
-}
-
-// Clears the cached file reference, forcing the next load/save to re-resolve from
-// scratch. Useful if sharing settings change or someone needs to point at a new file.
-function resetSharedFileRef(){
-  _sharedFileRef=null;
-  localStorage.removeItem('bcs-shared-file-ref');
-}
-
-// Hard re-sync: clears the stale file reference and reloads from OneDrive
-// from scratch. Use this if you signed in on a new device and data isn't
-// loading, or if the sync badge shows an error after making changes.
-async function forceResync(){
-  if(!msAccount){alert('Please sign in with Microsoft first.');return;}
-  resetSharedFileRef();
-  setSyncBadge('syncing','Re-syncing from OneDrive…');
-  toast('Clearing cached reference and reloading from OneDrive…');
-  await loadFromOneDrive();
-}
-
-async function loadFromOneDrive(){
-  const token=await getGraphToken();
-  if(!token){setSyncBadge('error','Auth failed');return;}
-  try{
-    const ref=await resolveSharedDataFile(token);
-    const url=ref
-      ? `https://graph.microsoft.com/v1.0/drives/${ref.driveId}/items/${ref.itemId}/content`
-      : `https://graph.microsoft.com/v1.0/me/drive/root:/${ONEDRIVE_FILE}:/content`;
-    const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`}});
-    if(res.ok){
-      const text=await res.text();
-      const data=JSON.parse(text);
+    if(!res.ok)throw new Error(`JSONBin load failed: ${res.status}`);
+    const data=await res.json();
+    if(data&&typeof data==='object'&&Object.keys(data).length>0){
       Object.assign(appState,data);
       applyState();
+      _lastKnownSaveTimestamp=data.lastSaved||null;
       setSyncBadge('synced',`Synced · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`);
-      toast(ref&&!ref.isOwner?'Loaded shared team data from OneDrive.':'Data loaded from OneDrive.');
-    } else if(res.status===404&&ref){
-      // Cached ref points to a deleted/moved file — clear it and try root path
-      console.warn('OneDrive: stale file ref on load, clearing...');
-      resetSharedFileRef();
-      const retryRes=await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${ONEDRIVE_FILE}:/content`,{headers:{Authorization:`Bearer ${token}`}});
-      if(retryRes.ok){
-        const text=await retryRes.text();
-        Object.assign(appState,JSON.parse(text));
-        applyState();
-        setSyncBadge('synced','Synced (re-resolved)');
-        toast('Re-connected to OneDrive data file.');
-      } else {
-        setSyncBadge('synced','OneDrive ready · No data yet');
-        toast('Connected to OneDrive. Your data will save there automatically.');
-      }
-    } else if(res.status===404){
-      setSyncBadge('synced','OneDrive ready · No data yet');
-      toast('Connected to OneDrive. Your data will save there automatically.');
-    } else {
-      setSyncBadge('error',`Load failed (${res.status})`);
-      console.warn('OneDrive load error:',res.status);
+      return true;
     }
+    setSyncBadge('synced','Ready');
+    return false;
   }catch(e){
-    setSyncBadge('error','Load failed');
-    console.warn('OneDrive load error:',e);
+    console.warn('JSONBin load error:',e);
+    setSyncBadge('error','Load failed — using local data');
+    return false;
   }
 }
 
-// Before overwriting the shared OneDrive file, pull down whatever's there
-// right now and merge in anything that exists remotely but not locally —
-// specifically the append-heavy lists that get edited from multiple devices
-// in quick succession (To-Do tasks, meetings, the activity log). Without
-// this, saving from Device B would silently wipe out a task someone added
-// on Device A moments earlier, since a plain overwrite has no way to know
-// about changes it hasn't seen yet. This is a simple union-by-id merge, not
-// a full conflict resolver — if the SAME item was edited differently on two
-// devices between syncs, the most recent save still wins for that one item,
-// but nothing gets silently dropped wholesale.
-async function mergeRemoteBeforeSave(token,url){
+async function saveToJSONBin(){
+  if(_isSaving)return false; // skip if already mid-save
+  _isSaving=true;
   try{
-    const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`}});
-    if(!res.ok)return; // nothing to merge (new file, or fetch failed) — proceed with local state as-is
-    const remote=JSON.parse(await res.text());
+    const res=await fetch(JSONBIN_URL,{
+      method:'PUT',
+      headers:{
+        'Content-Type':'application/json',
+        'X-Master-Key':JSONBIN_KEY
+      },
+      body:JSON.stringify(appState,null,2)
+    });
+    if(res.ok){
+      setSyncBadge('synced',`Synced · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`);
+      return true;
+    } else {
+      setSyncBadge('error',`Sync failed (${res.status})`);
+      return false;
+    }
+  }catch(e){
+    setSyncBadge('error','Sync failed — offline?');
+    console.warn('JSONBin save error:',e);
+    return false;
+  }finally{
+    _isSaving=false;
+  }
+}
 
-    // To-Do lists: union by task id, per person
+// Background poll every 2 minutes — pulls in changes other users made
+async function backgroundSync(){
+  try{
+    const res=await fetch(JSONBIN_URL+'/latest',{
+      headers:{'X-Master-Key':JSONBIN_KEY,'X-Bin-Meta':'false'}
+    });
+    if(!res.ok)return;
+    const remote=await res.json();
+    const remoteTimestamp=remote.lastSaved||null;
+    const remoteSavedBy=remote.lastSavedBy||null;
+    if(remoteTimestamp&&remoteTimestamp===_lastKnownSaveTimestamp)return; // nothing new
+
+    const myName=appState.lastSavedBy||'';
+    const savedByOther=remoteSavedBy&&remoteSavedBy!==myName;
+    let changeCount=0;
+
+    // Merge todos by id
     if(remote.todos){
       if(!appState.todos)appState.todos={};
       TODO_PEOPLE.forEach(person=>{
         const local=appState.todos[person]||[];
         const remoteList=remote.todos[person]||[];
         const localIds=new Set(local.map(t=>t.id));
-        const onlyRemote=remoteList.filter(t=>!localIds.has(t.id));
-        appState.todos[person]=[...local,...onlyRemote];
+        const newItems=remoteList.filter(t=>!localIds.has(t.id));
+        if(newItems.length){appState.todos[person]=[...local,...newItems];changeCount+=newItems.length;}
+        remoteList.forEach(rt=>{
+          const lt=local.find(x=>x.id===rt.id);
+          if(lt&&lt.done!==rt.done){lt.done=rt.done;changeCount++;}
+        });
       });
     }
-
-    // Meetings: union by id
     if(Array.isArray(remote.meetingsList)){
       if(!appState.meetingsList)appState.meetingsList=[];
       const localIds=new Set(appState.meetingsList.map(m=>m.id));
-      const onlyRemote=remote.meetingsList.filter(m=>!localIds.has(m.id));
-      appState.meetingsList=[...appState.meetingsList,...onlyRemote];
+      const newItems=remote.meetingsList.filter(m=>!localIds.has(m.id));
+      if(newItems.length){appState.meetingsList=[...appState.meetingsList,...newItems];changeCount+=newItems.length;}
     }
-
-    // Activity log: union by id, then re-sort newest first and re-cap
-    if(Array.isArray(remote.activityLog)){
-      if(!appState.activityLog)appState.activityLog=[];
-      const localIds=new Set(appState.activityLog.map(a=>a.id));
-      const onlyRemote=remote.activityLog.filter(a=>!localIds.has(a.id));
-      appState.activityLog=[...appState.activityLog,...onlyRemote]
-        .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp))
-        .slice(0,200);
-    }
-
-    // Bids: union by id (covers a bid added on one device, edited on another)
     if(Array.isArray(remote.bids)){
       if(!appState.bids)appState.bids=[];
       const localIds=new Set(appState.bids.map(b=>b.id));
-      const onlyRemote=remote.bids.filter(b=>!localIds.has(b.id));
-      appState.bids=[...appState.bids,...onlyRemote];
+      const newItems=remote.bids.filter(b=>!localIds.has(b.id));
+      if(newItems.length){appState.bids=[...appState.bids,...newItems];changeCount+=newItems.length;}
     }
-  }catch(e){
-    console.warn('Pre-save merge skipped (non-fatal):',e);
-  }
-}
+    if(Array.isArray(remote.billingRecords)){
+      if(!appState.billingRecords)appState.billingRecords=[];
+      const localIds=new Set(appState.billingRecords.map(b=>b.id));
+      const newItems=remote.billingRecords.filter(b=>!localIds.has(b.id));
+      if(newItems.length){appState.billingRecords=[...appState.billingRecords,...newItems];changeCount+=newItems.length;}
+    }
+    if(Array.isArray(remote.projectData)){
+      const localIds=new Set(projectData.map(p=>p.id));
+      remote.projectData.forEach(rp=>{if(!localIds.has(rp.id)){projectData.push(rp);changeCount++;}});
+    }
 
-async function saveToOneDrive(){
-  const token=await getGraphToken();
-  if(!token){
-    setSyncBadge('error','Not signed in');
-    return false;
-  }
-  try{
-    const ref=await resolveSharedDataFile(token);
-    const url=ref
-      ? `https://graph.microsoft.com/v1.0/drives/${ref.driveId}/items/${ref.itemId}/content`
-      : `https://graph.microsoft.com/v1.0/me/drive/root:/${ONEDRIVE_FILE}:/content`;
+    _lastKnownSaveTimestamp=remoteTimestamp;
 
-    await mergeRemoteBeforeSave(token,url);
-    // If the merge pulled in anything new, refresh the visible UI so it
-    // shows up immediately rather than waiting for the next full reload.
-    TODO_PEOPLE.forEach(p=>{if(document.getElementById(`page-todo-${p}`)?.classList.contains('active'))renderTodoPage(p);});
-    updateTodoBadges();
-    if(window._currentProjectId)renderDetailMeetings(window._currentProjectId);
-    if(document.getElementById('page-dashboard')?.classList.contains('active')){renderDashboardMeetings();renderRecentActivity();}
-    if(document.getElementById('page-bids')?.classList.contains('active'))renderBidsBoard();
-
-    const res=await fetch(url,{
-      method:'PUT',
-      headers:{
-        Authorization:`Bearer ${token}`,
-        'Content-Type':'application/json'
-      },
-      body:JSON.stringify(appState,null,2)
-    });
-    if(res.ok){
-      // Cache the file location after first save so future calls don't re-resolve
-      if(!ref){
-        try{
-          const meta=await res.json();
-          if(meta&&meta.parentReference){
-            _sharedFileRef={driveId:meta.parentReference.driveId,itemId:meta.id,isOwner:true};
-            localStorage.setItem('bcs-shared-file-ref',JSON.stringify(_sharedFileRef));
-          }
-        }catch(e){/* non-fatal */}
+    if(changeCount>0||savedByOther){
+      updateTodoBadges();updateBillingBadge();renderProjectCards();pruneOldMeetings();
+      const activePage=document.querySelector('.page.active');
+      if(activePage){
+        const pid=activePage.id;
+        if(pid==='page-dashboard')renderDashboard();
+        else if(pid==='page-billing')renderBillingPage();
+        else if(pid==='page-bids')renderBidsBoard();
+        TODO_PEOPLE.forEach(p=>{if(pid===`page-todo-${p}`)renderTodoPage(p);});
       }
-      setSyncBadge('synced',`Synced · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`);
-      return true;
-    } else if((res.status===404||res.status===410)&&ref){
-      // The cached file reference points to a file that no longer exists
-      // (e.g. it was deleted, or the item ID changed). Clear the stale ref
-      // and retry once using the root path, which will create the file fresh.
-      console.warn('OneDrive: cached file ref invalid ('+res.status+'), clearing and retrying...');
-      resetSharedFileRef();
-      const retryUrl=`https://graph.microsoft.com/v1.0/me/drive/root:/${ONEDRIVE_FILE}:/content`;
-      const retryRes=await fetch(retryUrl,{
-        method:'PUT',
-        headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
-        body:JSON.stringify(appState,null,2)
-      });
-      if(retryRes.ok){
-        setSyncBadge('synced',`Synced · ${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`);
-        toast('Re-synced to OneDrive after resolving file reference.');
-        return true;
-      }
-      setSyncBadge('error',`Sync failed (${retryRes.status})`);
-      return false;
-    } else {
-      setSyncBadge('error',`Sync failed (${res.status})`);
-      console.warn('OneDrive save error:',res.status,res.statusText);
-      return false;
+      const who=savedByOther?(remoteSavedBy.split(' ')[0]||'Someone'):'Someone';
+      const timeStr=remoteTimestamp?new Date(remoteTimestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'';
+      setSyncBadge('synced',`Synced · ${timeStr}`);
+      if(savedByOther)toast(`${who} updated the app — pulled in latest changes.`);
     }
-  }catch(e){
-    setSyncBadge('error','Sync failed — offline?');
-    console.warn('OneDrive save error:',e);
-    return false;
-  }
+  }catch(e){console.warn('Background sync error:',e);}
 }
 
-// Generates a shareable OneDrive link for the data file and shows it to the user,
-// so they can send it to teammates. Teammates must open this link once and accept
-// access (or be added directly via shareDataFileWithPeople) before they can sign
-// into the app and see the same data.
-async function getShareableDataFileLink(){
-  const token=await getGraphToken();
-  if(!token){alert('Please sign in with Microsoft first.');return null;}
+function startBackgroundSync(){
+  if(_bgSyncInterval)clearInterval(_bgSyncInterval);
+  backgroundSync();
+  _bgSyncInterval=setInterval(backgroundSync,2*60*1000);
+}
+
+function stopBackgroundSync(){
+  if(_bgSyncInterval){clearInterval(_bgSyncInterval);_bgSyncInterval=null;}
+}
+
+// ── Manual sync button ───────────────────────────────────────
+async function manualSync(){
+  const btn=document.getElementById('manual-sync-btn');
+  if(btn){btn.querySelector('i').classList.add('ti-spin');btn.disabled=true;}
+  await backgroundSync();
+  setSyncBadge('syncing','Saving…');
   try{
-    const ref=await resolveSharedDataFile(token);
-    if(!ref){
-      alert('No data file found yet — make at least one change first so it gets created in your OneDrive, then try sharing again.');
-      return null;
-    }
-    const res=await fetch(`https://graph.microsoft.com/v1.0/drives/${ref.driveId}/items/${ref.itemId}/createLink`,{
-      method:'POST',
-      headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
-      body:JSON.stringify({type:'edit',scope:'organization'})
-    });
-    if(res.ok){
-      const data=await res.json();
-      return data.link?.webUrl||null;
-    } else {
-      console.warn('createLink failed:',res.status,await res.text());
-      return null;
-    }
+    snapshotDOM();
+    const ok=await saveToJSONBin();
+    if(ok)toast('Synced.');
   }catch(e){
-    console.warn('getShareableDataFileLink error:',e);
-    return null;
+    setSyncBadge('error','Sync failed');
+    console.warn('Manual sync error:',e);
   }
+  if(btn){btn.querySelector('i').classList.remove('ti-spin');btn.disabled=false;}
 }
 
-// Shares the data file directly with specific people by email, granting edit access.
-// This is the most reliable way for teammates to gain access (vs a generic link,
-// which can behave differently depending on org sharing policy).
-async function shareDataFileWithPeople(emails){
-  const token=await getGraphToken();
-  if(!token){alert('Please sign in with Microsoft first.');return false;}
-  const ref=await resolveSharedDataFile(token);
-  if(!ref){
-    alert('No data file found yet — make at least one change first so it gets created in your OneDrive, then try sharing again.');
-    return false;
-  }
-  try{
-    const res=await fetch(`https://graph.microsoft.com/v1.0/drives/${ref.driveId}/items/${ref.itemId}/invite`,{
-      method:'POST',
-      headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
-      body:JSON.stringify({
-        recipients:emails.map(e=>({email:e.trim()})),
-        message:'You now have access to the shared BCS Manager project data. Sign in with Microsoft inside BCS Manager using this email to see the same data.',
-        requireSignIn:true,
-        sendInvitation:true,
-        roles:['write']
-      })
-    });
-    if(res.ok)return true;
-    console.warn('invite failed:',res.status,await res.text());
-    return false;
-  }catch(e){
-    console.warn('shareDataFileWithPeople error:',e);
-    return false;
-  }
-}
+// Stubs for any remaining references to MS auth functions
+function msSignIn(){}
+function msSignOut(){}
+function forceResync(){manualSync();}
+function resetSharedFileRef(){}
+let msAccount=null; // kept as stub — no Microsoft auth in this version
 
-// UI handler for the Share with Team modal — parses comma-separated emails and sends invites
-async function sendTeamShareInvite(){
-  const input=document.getElementById('share-team-email');
-  const statusEl=document.getElementById('share-team-status');
-  const raw=input.value.trim();
-  if(!raw){
-    statusEl.textContent='Please enter at least one email address.';
-    statusEl.style.color='var(--red)';
-    return;
-  }
-  const emails=raw.split(',').map(e=>e.trim()).filter(Boolean);
-  const invalid=emails.filter(e=>!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
-  if(invalid.length){
-    statusEl.textContent=`That doesn't look like a valid email: ${invalid[0]}`;
-    statusEl.style.color='var(--red)';
-    return;
-  }
-  statusEl.textContent='Sending invite…';
-  statusEl.style.color='var(--gray-500)';
-  const ok=await shareDataFileWithPeople(emails);
-  if(ok){
-    statusEl.textContent=`Access granted to ${emails.join(', ')}. They'll get an email and can now sign in with Microsoft to see this same data.`;
-    statusEl.style.color='var(--green)';
-    input.value='';
-    toast('Team invite sent.');
-  } else {
-    statusEl.textContent='Could not send the invite. Make sure you\'re signed in and try again.';
-    statusEl.style.color='var(--red)';
-  }
-}
 
 // ── Project Report Export (PDF, saved to OneDrive: BCS Manager/Documents) ──
 const REPORT_ONEDRIVE_FOLDER='BCS Manager/Documents';
@@ -2565,17 +2253,12 @@ async function exportProjectReport(){
     const fileName=`${p.name.replace(/[^\w\s-]/g,'').replace(/\s+/g,'-')}-Report-${new Date().toISOString().slice(0,10)}.pdf`;
 
     if(msAccount){
-      toast('Uploading report to OneDrive…');
-      const ok=await uploadReportToOneDrive(pdfBlob,fileName);
-      if(ok){
-        toast(`Report saved to OneDrive: ${REPORT_ONEDRIVE_FOLDER}/${fileName}`);
-      } else {
-        downloadBlob(pdfBlob,fileName);
-        toast('Could not reach OneDrive — downloaded the report locally instead.');
-      }
+      // Legacy OneDrive path — kept as stub, falls through to download
+      downloadBlob(pdfBlob,fileName);
+      toast('Report downloaded.');
     } else {
       downloadBlob(pdfBlob,fileName);
-      toast('Report downloaded. Sign in with Microsoft to save directly to OneDrive next time.');
+      toast('Report downloaded.');
     }
   }catch(e){
     console.error('Report export error:',e);
@@ -2593,33 +2276,9 @@ function downloadBlob(blob,fileName){
   a.click();
 }
 
-async function uploadReportToOneDrive(blob,fileName){
-  const token=await getGraphToken();
-  if(!token)return false;
-  try{
-    const path=`${REPORT_ONEDRIVE_FOLDER}/${fileName}`;
-    const encodedPath=encodeURIComponent(path).replace(/%2F/g,'/');
-    // Write the report into the same shared drive the data file lives on (so teammates'
-    // reports land in the same place as the owner's), falling back to the signed-in
-    // user's own drive if no shared file has been resolved yet.
-    const ref=await resolveSharedDataFile(token);
-    const url=ref
-      ? `https://graph.microsoft.com/v1.0/drives/${ref.driveId}/root:/${encodedPath}:/content`
-      : `https://graph.microsoft.com/v1.0/me/drive/root:/${encodedPath}:/content`;
-    const res=await fetch(url,{
-      method:'PUT',
-      headers:{
-        Authorization:`Bearer ${token}`,
-        'Content-Type':'application/pdf'
-      },
-      body:blob
-    });
-    return res.ok;
-  }catch(e){
-    console.warn('Report upload error:',e);
-    return false;
-  }
-}
+async function uploadReportToOneDrive(blob,fileName){return false;}
+async function getGraphToken(){return null;}
+async function resolveSharedDataFile(){return null;}
 
 // ── To-Do lists ──────────────────────────────────────────────
 // Simple per-person task lists for Clay, Kyle, and Brian. Each list is an
@@ -3140,162 +2799,6 @@ function odFormatSize(bytes){
   return (bytes/1073741824).toFixed(1)+'GB';
 }
 
-// ── Background sync ──────────────────────────────────────────
-// Polls OneDrive every 2 minutes while the user is signed in, merging in
-// any changes other team members have saved since the last load. Uses the
-// same union-by-ID merge logic as pre-save merging so local unsaved edits
-// are never overwritten — only NEW items from remote get added locally.
-// Shows a toast when new data arrives so users know something changed.
-let _bgSyncInterval=null;
-let _lastKnownSaveTimestamp=null; // tracks the remote lastSaved so we only
-                                  // notify when something actually changed
-
-async function backgroundSync(){
-  if(!msAccount)return; // not signed in — nothing to poll
-  const token=await getGraphToken();
-  if(!token)return;
-
-  try{
-    const ref=await resolveSharedDataFile(token);
-    const url=ref
-      ?`https://graph.microsoft.com/v1.0/drives/${ref.driveId}/items/${ref.itemId}/content`
-      :`https://graph.microsoft.com/v1.0/me/drive/root:/${ONEDRIVE_FILE}:/content`;
-
-    const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`}});
-    if(!res.ok)return;
-
-    const remote=JSON.parse(await res.text());
-
-    // Check if anything actually changed since our last check
-    const remoteTimestamp=remote.lastSaved||null;
-    const remoteSavedBy=remote.lastSavedBy||null;
-    if(remoteTimestamp&&remoteTimestamp===_lastKnownSaveTimestamp){
-      return; // nothing new — skip merge entirely
-    }
-
-    // Something changed — figure out who saved it and whether it was us
-    const myName=msAccount?(msAccount.name||msAccount.username||''):'';
-    const savedByOther=remoteSavedBy&&myName&&!remoteSavedBy.startsWith(myName.split(' ')[0]);
-
-    // Merge in new items by ID (same logic as mergeRemoteBeforeSave)
-    let changeCount=0;
-
-    if(remote.todos){
-      if(!appState.todos)appState.todos={};
-      TODO_PEOPLE.forEach(person=>{
-        const local=appState.todos[person]||[];
-        const remoteList=remote.todos[person]||[];
-        const localIds=new Set(local.map(t=>t.id));
-        const newItems=remoteList.filter(t=>!localIds.has(t.id));
-        if(newItems.length){
-          appState.todos[person]=[...local,...newItems];
-          changeCount+=newItems.length;
-        }
-        // Also sync done-status updates for existing items
-        remoteList.forEach(rt=>{
-          const lt=local.find(x=>x.id===rt.id);
-          if(lt&&lt.done!==rt.done){lt.done=rt.done;changeCount++;}
-        });
-      });
-    }
-
-    if(Array.isArray(remote.meetingsList)){
-      if(!appState.meetingsList)appState.meetingsList=[];
-      const localIds=new Set(appState.meetingsList.map(m=>m.id));
-      const newItems=remote.meetingsList.filter(m=>!localIds.has(m.id));
-      if(newItems.length){appState.meetingsList=[...appState.meetingsList,...newItems];changeCount+=newItems.length;}
-    }
-
-    if(Array.isArray(remote.bids)){
-      if(!appState.bids)appState.bids=[];
-      const localIds=new Set(appState.bids.map(b=>b.id));
-      const newItems=remote.bids.filter(b=>!localIds.has(b.id));
-      if(newItems.length){appState.bids=[...appState.bids,...newItems];changeCount+=newItems.length;}
-    }
-
-    if(Array.isArray(remote.billingRecords)){
-      if(!appState.billingRecords)appState.billingRecords=[];
-      const localIds=new Set(appState.billingRecords.map(b=>b.id));
-      const newItems=remote.billingRecords.filter(b=>!localIds.has(b.id));
-      if(newItems.length){appState.billingRecords=[...appState.billingRecords,...newItems];changeCount+=newItems.length;}
-    }
-
-    // Sync projectData changes — update existing projects and add new ones
-    if(Array.isArray(remote.projectData)){
-      const localIds=new Set(projectData.map(p=>p.id));
-      remote.projectData.forEach(rp=>{
-        if(!localIds.has(rp.id)){
-          projectData.push(rp);
-          changeCount++;
-        }
-      });
-    }
-
-    // Update our timestamp record
-    _lastKnownSaveTimestamp=remoteTimestamp;
-
-    // If something changed, refresh UI and notify
-    if(changeCount>0||savedByOther){
-      updateTodoBadges();
-      updateBillingBadge();
-      renderProjectCards();
-      pruneOldMeetings();
-      // Re-render whichever page is currently visible
-      const activePage=document.querySelector('.page.active');
-      if(activePage){
-        const pid=activePage.id;
-        if(pid==='page-dashboard')renderDashboard();
-        else if(pid==='page-billing')renderBillingPage();
-        else if(pid==='page-bids')renderBidsBoard();
-        TODO_PEOPLE.forEach(p=>{if(pid===`page-todo-${p}`)renderTodoPage(p);});
-      }
-
-      const who=savedByOther?remoteSavedBy.split(' ')[0]:'Someone';
-      const timeStr=remoteTimestamp?new Date(remoteTimestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'';
-      setSyncBadge('synced',`Synced · ${timeStr}`);
-      if(savedByOther){
-        toast(`${who} updated the app${timeStr?' at '+timeStr:''} — pulled in latest changes.`);
-      }
-    }
-  }catch(e){
-    console.warn('Background sync error (non-fatal):',e);
-  }
-}
-
-function startBackgroundSync(){
-  if(_bgSyncInterval)clearInterval(_bgSyncInterval);
-  // Run immediately once, then every 2 minutes
-  backgroundSync();
-  _bgSyncInterval=setInterval(backgroundSync,2*60*1000);
-}
-
-function stopBackgroundSync(){
-  if(_bgSyncInterval){clearInterval(_bgSyncInterval);_bgSyncInterval=null;}
-}
-
-// ── Manual sync button ───────────────────────────────────────
-async function manualSync(){
-  const btn=document.getElementById('manual-sync-btn');
-  if(btn){btn.querySelector('i').classList.add('ti-spin');btn.disabled=true;}
-  if(!msAccount){
-    toast('Sign in with Microsoft first to sync.');
-    if(btn){btn.querySelector('i').classList.remove('ti-spin');btn.disabled=false;}
-    return;
-  }
-  // Pull in any remote changes first, then save local state
-  await backgroundSync();
-  setSyncBadge('syncing','Saving…');
-  try{
-    snapshotDOM();
-    const ok=await saveToOneDrive();
-    if(ok)toast('Synced to OneDrive.');
-  }catch(e){
-    setSyncBadge('error','Sync failed');
-    console.warn('Manual sync error:',e);
-  }
-  if(btn){btn.querySelector('i').classList.remove('ti-spin');btn.disabled=false;}
-}
-
 function setSyncBadge(state,label){
   const badge=document.getElementById('sync-badge');
   const lbl=document.getElementById('sync-label');
@@ -3308,19 +2811,13 @@ function saveState(){
   try{
     snapshotDOM();
     appState.lastSaved=new Date().toISOString();
-    appState.lastSavedBy=msAccount?(msAccount.name||msAccount.username||'Unknown'):'Local';
+    appState.lastSavedBy=appState.lastSavedBy||'Team';
     // Always save to localStorage as local backup
     localStorage.setItem(STORAGE_KEY,JSON.stringify(appState));
-    if(msAccount){
-      // Save to OneDrive
-      setSyncBadge('syncing','Saving to OneDrive…');
-      saveToOneDrive().then(ok=>{
-        if(ok)showSaved();
-      });
-    } else {
-      // Not signed in — localStorage only
-      showSaved();
-    }
+    setSyncBadge('syncing','Saving…');
+    saveToJSONBin().then(ok=>{
+      if(ok)showSaved();
+    });
   }catch(e){console.warn('BCS Manager: could not save state',e);}
 }
 
@@ -3330,14 +2827,18 @@ function scheduleSave(){
   ind.className='save-indicator saving';
   lbl.textContent='Saving…';
   clearTimeout(saveTimer);
-  saveTimer=setTimeout(saveState,800);
+  // Add a small random jitter (0–1.5s) on top of the base 800ms debounce
+  // so two users saving at the same moment don't both hit OneDrive
+  // simultaneously, which would cause a 409 conflict error.
+  const jitter=Math.floor(Math.random()*1500);
+  saveTimer=setTimeout(saveState,800+jitter);
 }
 
 function showSaved(){
   const ind=document.getElementById('save-indicator');
   const lbl=document.getElementById('save-label');
   ind.className='save-indicator saved';
-  lbl.textContent=msAccount?'Saved to OneDrive':'Saved locally';
+  lbl.textContent='Saved';
   setTimeout(()=>{ind.className='save-indicator fade';},2500);
 }
 
@@ -3371,7 +2872,7 @@ function importData(e){
       catch(storageErr){console.warn('localStorage quota exceeded — data kept in memory and will sync to OneDrive if signed in.',storageErr);}
       applyState();
       showSaved();
-      if(msAccount)saveToOneDrive();
+      if(msAccount)saveToJSONBin();
       toast('Data restored from backup.');
     }catch(err){
       console.error('Import error:',err);
@@ -8219,8 +7720,10 @@ window.openModal=function(id){
 })();
 loadState();
 applyState();
-setTimeout(()=>{
-  initMSAL();
+// Load from JSONBin on startup — no login needed
+setTimeout(async()=>{
+  await loadFromJSONBin();
+  startBackgroundSync();
 },150);
 </script>
 <!-- ONEDRIVE WELCOME MODAL -->
@@ -8481,10 +7984,39 @@ setTimeout(()=>{
       <div id="share-team-status" style="font-size:12px;text-align:center;color:var(--gray-500);min-height:18px;margin-bottom:12px"></div>
       <div style="border-top:1px solid var(--gray-200);padding-top:14px">
         <div style="font-size:11px;color:var(--gray-500);margin-bottom:8px">Repeat for a second teammate, or paste a list separated by commas above.</div>
+        <div style="font-size:12px;color:var(--gray-500);margin-top:10px;padding-top:10px;border-top:1px solid var(--gray-100)">
+          <strong>Teammate not seeing data?</strong> Send them this link to manually connect:
+          <button class="btn" style="margin-top:8px;font-size:11px;width:100%" onclick="copyConnectLink()"><i class="ti ti-copy"></i> Copy teammate connect link</button>
+          <div id="connect-link-copied" style="font-size:11px;color:var(--green);text-align:center;margin-top:4px;display:none">Copied! Send this link to your teammate.</div>
+        </div>
       </div>
     </div>
     <div class="modal-footer">
       <button class="btn" onclick="closeModal('share-team-modal')">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- CONNECT TO SHARED DATA MODAL — for teammates whose auto-discovery failed -->
+<div class="modal-overlay" id="connect-data-modal">
+  <div class="modal" style="width:500px">
+    <div class="modal-header">
+      <div class="modal-title"><i class="ti ti-plug-connected" style="margin-right:6px"></i>Connect to Team Data</div>
+      <button class="modal-close" onclick="closeModal('connect-data-modal')"><i class="ti ti-x"></i></button>
+    </div>
+    <div class="modal-body" style="padding:20px">
+      <div style="font-size:13px;color:var(--gray-700);margin-bottom:16px;line-height:1.6">
+        Your app couldn't automatically find the shared data file. Paste the connection code below — your team admin can copy it from the <strong>Share with Team</strong> button after signing in.
+      </div>
+      <div class="form-group">
+        <label class="form-label">Connection code</label>
+        <input class="form-input" id="connect-code-input" placeholder="Paste connection code here…" style="font-family:monospace;font-size:12px">
+      </div>
+      <div id="connect-code-error" style="font-size:12px;color:var(--red);margin-top:6px;display:none"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('connect-data-modal')">Cancel</button>
+      <button class="btn btn-primary" onclick="applyConnectCode()"><i class="ti ti-plug-connected"></i> Connect</button>
     </div>
   </div>
 </div>
